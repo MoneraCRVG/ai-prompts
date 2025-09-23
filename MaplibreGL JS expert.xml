@@ -1,0 +1,387 @@
+<actor_setup>
+Act as an MaplibreGL JS version ^5.7.1 senior engineer. Use your full context window to analyze the request and reason step-by-step internally. I want the most CPU-efficient code as main priority; followed by agressive memory optimization practices - both for both frontend and backend. If you need any context, for example, an file, abort the inference and ask me to include the file in the context/prompt. Return me only an code block - I don't want any text explanations. Don't do anything else that the request provided didn't specify.
+</actor_setup>
+
+<request>
+Animate the popups with fade in and fade out, when active territory changes. I also want to animate the territory extrusion and color change (from startColor and hoverColor), for both scenarios, when the current territory is not active anymore (exit) and when it is now active (entry)
+</request>
+
+<base_code>
+// Module-level cache for shared data with reference counting
+let cachedTerritoriesData = null;
+let territoriesDataPromise = null;
+let cacheReferenceCount = 0;
+
+// Precomputed color values - Dark Theme
+const startColor = '#3e3e3e'; // Inactive territory color
+const endColor = '#b1b1b1';   // Active/Hover territory color
+const hoverColor = '#676767';
+
+// Main map controller
+class MapController {
+    constructor(container) {
+        this.container = container;
+        this.map = null;
+        this.filteredFeatures = [];
+        this.territoryNameToIndex = {};
+        this.currentIndex = 0;
+        this.activeTerritoryName = null;
+        this.hoveredTerritoryName = null;
+        this.isProcessing = false;
+
+        // Properties for auto-cycle feature
+        this.cycleIntervalId = null;
+        this.popup = null;
+
+        // Bind event handlers to the instance
+        this.wheelListener = this.handleWheel.bind(this);
+        this.clickListener = this.handleClick.bind(this);
+        this.mouseMoveListener = this.handleMouseMove.bind(this);
+        this.mouseEnterListener = this.handleMouseEnter.bind(this);
+        this.mouseLeaveListener = this.handleMouseLeave.bind(this);
+    }
+
+    initialize() {
+        if (!window.maplibregl) {
+            console.error("MapLibreGL library not found.");
+            return;
+        }
+
+        this.map = new maplibregl.Map({
+            container: this.container,
+            style: 'assets/maplibregl-style.json',
+            center: [-55, -23],
+            zoom: 9,
+            pitch: 85,
+            bearing: 315,
+            interactive: false,
+            attributionControl: false
+        });
+
+        this.map.on('load', this.onMapLoad.bind(this));
+    }
+
+    onMapLoad() {
+        if (this.map.getSource('territories')) return;
+        this.loadData()
+            .then(data => this.processData(data))
+            .catch(error => console.error('Failed to load map data:', error));
+    }
+
+    async loadData() {
+        cacheReferenceCount++;
+        if (cachedTerritoriesData) return cachedTerritoriesData;
+        if (territoriesDataPromise) return territoriesDataPromise;
+
+        territoriesDataPromise = fetch('/assets/territorios_atuacao.json')
+            .then(response => response.json())
+            .then(data => {
+                cachedTerritoriesData = data;
+                return data;
+            })
+            .catch(error => {
+                console.error('Error loading GeoJSON:', error);
+                territoriesDataPromise = null; // Allow retries
+                throw error;
+            });
+
+        return territoriesDataPromise;
+    }
+
+    processData(data) {
+        this.filteredFeatures = data.features.filter(feature =>
+            feature.properties.territorio_atuacao === true
+        );
+
+        this.filteredFeatures.forEach((feature, index) => {
+            this.territoryNameToIndex[feature.properties.nome] = index;
+        });
+
+        this.map.addSource('territories', {
+            type: 'geojson',
+            data: data,
+            promoteId: 'nome'
+        });
+
+        this.map.addLayer({
+            id: 'territories-extrusion',
+            type: 'fill-extrusion',
+            source: 'territories',
+            filter: ['==', ['get', 'territorio_atuacao'], true],
+            paint: {
+                'fill-extrusion-color': [
+                    'case',
+                    ['boolean', ['feature-state', 'active'], false], endColor,
+                    ['boolean', ['feature-state', 'hover'], false], hoverColor,
+                    startColor
+                ],
+                'fill-extrusion-opacity': 1,
+                'fill-extrusion-height': [
+                    'case',
+                    ['boolean', ['feature-state', 'active'], false], 2000,
+                    ['boolean', ['feature-state', 'hover'], false], 1500,
+                    1000
+                ],
+                'fill-extrusion-base': 0,
+                'fill-extrusion-color-transition': { duration: 250 },
+                'fill-extrusion-height-transition': { duration: 250 }
+            }
+        });
+
+        this.map.addLayer({
+            id: 'territories-outline',
+            type: 'line',
+            source: 'territories',
+            paint: { 'line-color': '#FFFFFF', 'line-width': 1 }
+        });
+
+        this.container.addEventListener('wheel', this.wheelListener, { passive: false });
+        this.map.on('click', 'territories-extrusion', this.clickListener);
+        this.map.on('mousemove', 'territories-extrusion', this.mouseMoveListener);
+        this.map.on('mouseenter', 'territories-extrusion', this.mouseEnterListener);
+        this.map.on('mouseleave', 'territories-extrusion', this.mouseLeaveListener);
+
+        // Start the automatic territory cycle
+        this.startAutoCycle();
+    }
+
+    setActiveTerritoryByIndex(index) {
+        if (this.isProcessing || index === this.currentIndex || !this.map) {
+            return;
+        }
+
+        this.isProcessing = true;
+        this.map.getCanvas().style.cursor = 'wait';
+
+        if (this.activeTerritoryName) {
+            this.map.setFeatureState(
+                { source: 'territories', id: this.activeTerritoryName },
+                { active: false }
+            );
+        }
+
+        this.currentIndex = index;
+        const feature = this.filteredFeatures[this.currentIndex];
+        this.activeTerritoryName = feature.properties.nome;
+
+        this.map.setFeatureState(
+            { source: 'territories', id: this.activeTerritoryName },
+            { active: true }
+        );
+
+        if (!feature.bbox) {
+            feature.bbox = turf.bbox(feature.geometry);
+        }
+
+        if (feature.bbox) {
+            this.map.fitBounds(feature.bbox, {
+                padding: 50,
+                duration: 1200,
+                easing: (t) => t * t * (3 - 2 * t),
+                essential: true
+            });
+
+            // --- POPUP & PROGRESS BAR ---
+            const center = [(feature.bbox[0] + feature.bbox[2]) / 2, (feature.bbox[1] + feature.bbox[3]) / 2];
+
+            if (!this.popup) {
+                this.popup = new maplibregl.Popup({
+                    closeButton: false,
+                    closeOnClick: false,
+                    anchor: 'bottom',
+                    offset: [0, -20]
+                });
+            }
+
+            const animationKey = Date.now();
+            const popupContent = `
+                <div style="background-color: rgba(44, 44, 44, 0.9); color: #fff; padding: 10px 15px; border-radius: 8px; font-family: sans-serif; width: 200px; text-align: center; backdrop-filter: blur(5px);">
+                    <h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: bold; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">${this.activeTerritoryName}</h3>
+                    <div style="height: 4px; background-color: #555; border-radius: 2px; overflow: hidden;">
+                        <div id="progress-bar-${animationKey}" style="height: 100%; background-color: #b1b1b1; width: 0; animation: progress-animation-${animationKey} 10s linear forwards;"></div>
+                    </div>
+                </div>
+                <style>
+                    @keyframes progress-animation-${animationKey} {
+                        from { width: 0%; }
+                        to { width: 100%; }
+                    }
+                    .maplibregl-popup-content { background: transparent; padding: 0; box-shadow: none; }
+                    .maplibregl-popup-tip { display: none; }
+                </style>
+            `;
+
+            this.popup
+                .setLngLat(center)
+                .setHTML(popupContent)
+                .addTo(this.map);
+        }
+
+        if (this.onIndexChange) {
+            this.onIndexChange(this.currentIndex, this.filteredFeatures.length);
+        }
+
+        setTimeout(() => {
+            this.isProcessing = false;
+            if (this.map) {
+                this.map.getCanvas().style.cursor = this.hoveredTerritoryName ? 'pointer' : '';
+            }
+        }, 300);
+    }
+
+    startAutoCycle() {
+        this.stopAutoCycle();
+        if (!this.filteredFeatures || this.filteredFeatures.length === 0) return;
+
+        // Immediately display the first territory
+        this.setActiveTerritoryByIndex(this.currentIndex);
+
+        this.cycleIntervalId = setInterval(() => {
+            if (!this.filteredFeatures || this.filteredFeatures.length === 0) {
+                this.stopAutoCycle();
+                return;
+            }
+            const nextIndex = (this.currentIndex + 1) % this.filteredFeatures.length;
+            this.setActiveTerritoryByIndex(nextIndex);
+        }, 10000); // 10 seconds
+    }
+
+    stopAutoCycle() {
+        if (this.cycleIntervalId) {
+            clearInterval(this.cycleIntervalId);
+            this.cycleIntervalId = null;
+        }
+    }
+
+    handleWheel(e) {
+        e.preventDefault();
+        if (this.isProcessing || this.filteredFeatures.length === 0) return;
+
+        let newIndex = this.currentIndex;
+        if (e.deltaY < 0 && this.currentIndex > 0) {
+            newIndex--;
+        } else if (e.deltaY > 0 && this.currentIndex < this.filteredFeatures.length - 1) {
+            newIndex++;
+        }
+
+        if (newIndex !== this.currentIndex) {
+            this.setActiveTerritoryByIndex(newIndex);
+        }
+    }
+
+    handleClick(e) {
+        if (this.isProcessing || !e.features || e.features.length === 0) return;
+        const feature = e.features[0];
+        const newIndex = this.territoryNameToIndex[feature.properties.nome];
+
+        if (newIndex !== undefined) {
+            this.setActiveTerritoryByIndex(newIndex);
+        }
+    }
+
+    handleMouseMove(e) {
+        if (this.isProcessing || e.features.length === 0) return;
+        const newHoverName = e.features[0].properties.nome;
+        if (newHoverName !== this.hoveredTerritoryName) {
+            if (this.hoveredTerritoryName) {
+                this.map.setFeatureState(
+                    { source: 'territories', id: this.hoveredTerritoryName },
+                    { hover: false }
+                );
+            }
+            this.hoveredTerritoryName = newHoverName;
+            this.map.setFeatureState(
+                { source: 'territories', id: this.hoveredTerritoryName },
+                { hover: true }
+            );
+        }
+    }
+
+    handleMouseEnter() {
+        if (this.isProcessing) return;
+        this.map.getCanvas().style.cursor = 'pointer';
+    }
+
+    handleMouseLeave() {
+        if (this.isProcessing) return;
+        this.map.getCanvas().style.cursor = '';
+        if (this.hoveredTerritoryName) {
+            this.map.setFeatureState(
+                { source: 'territories', id: this.hoveredTerritoryName },
+                { hover: false }
+            );
+            this.hoveredTerritoryName = null;
+        }
+    }
+
+    destroy() {
+        this.isProcessing = true;
+        this.stopAutoCycle(); // Stop the interval timer
+
+        if (this.popup) {
+            this.popup.remove();
+            this.popup = null;
+        }
+
+        this.container.removeEventListener('wheel', this.wheelListener);
+        if (this.map) {
+            this.map.off('click', 'territories-extrusion', this.clickListener);
+            this.map.off('mousemove', 'territories-extrusion', this.mouseMoveListener);
+            this.map.off('mouseenter', 'territories-extrusion', this.mouseEnterListener);
+            this.map.off('mouseleave', 'territories-extrusion', this.mouseLeaveListener);
+            if (this.map.loaded()) {
+                this.map.remove();
+            }
+            this.map = null;
+        }
+
+        this.filteredFeatures = [];
+        this.territoryNameToIndex = {};
+        this.activeTerritoryName = null;
+        this.hoveredTerritoryName = null;
+
+        cacheReferenceCount--;
+        if (cacheReferenceCount === 0) {
+            cachedTerritoriesData = null;
+            territoriesDataPromise = null;
+        }
+    }
+
+    setOnIndexChange(callback) {
+        this.onIndexChange = callback;
+    }
+}
+
+const mapInstances = new WeakMap();
+
+export function initMap(container) {
+    if (!container) {
+        console.error("Map container not found.");
+        return;
+    }
+    if (mapInstances.has(container)) {
+        destroyMap(container);
+    }
+    const controller = new MapController(container);
+    mapInstances.set(container, controller);
+    controller.initialize();
+}
+
+export function destroyMap(container) {
+    const controller = mapInstances.get(container);
+    if (controller) {
+        controller.destroy();
+        mapInstances.delete(container);
+    }
+}
+
+export function setOnIndexChange(container, callback) {
+    const controller = mapInstances.get(container);
+    if (controller) {
+        controller.setOnIndexChange(callback);
+    } else {
+        console.error("MapController not found for container");
+    }
+}
+
+</base_code>
